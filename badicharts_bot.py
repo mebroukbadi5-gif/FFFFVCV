@@ -3747,22 +3747,7 @@ def _qx_vwap(cs):
     return out
 
 
-_QX_MTF_MODES = ['none', 'or', 'and']
-_QX_MAX_VARIANTS = [
-    {'name': 'Z4',  'require': {'rsiDip': True,  'rsiNow': True, 'rsiRising': False, 'vwap': True, 'bbTouch': True, 'emaShort': False, 'trend1m': True}},
-    {'name': 'Z6',  'require': {'rsiDip': True,  'rsiNow': True, 'rsiRising': False, 'vwap': False, 'bbTouch': True, 'emaShort': False, 'trend1m': True}},
-    {'name': 'Z8',  'require': {'rsiDip': True,  'rsiNow': True, 'rsiRising': True,  'vwap': True, 'bbTouch': True, 'emaShort': False, 'trend1m': False}},
-    {'name': 'Z12', 'require': {'rsiDip': False, 'rsiNow': True, 'rsiRising': False, 'vwap': False, 'bbTouch': False, 'emaShort': False, 'trend1m': True}},
-    {'name': 'Z14', 'require': {'rsiDip': True,  'rsiNow': True, 'rsiRising': False, 'vwap': True, 'bbTouch': False, 'emaShort': False, 'trend1m': False}},
-    {'name': 'Z15', 'require': {'rsiDip': False, 'rsiNow': False, 'rsiRising': False, 'vwap': True, 'bbTouch': False, 'emaShort': False, 'trend1m': True}},
-]
-_QX_RSI_GRID = [
-    {'rsiDipLow': 30, 'rsiDipHigh': 70, 'rsiNowLow': 25, 'rsiNowHigh': 75},
-    {'rsiDipLow': 35, 'rsiDipHigh': 65, 'rsiNowLow': 30, 'rsiNowHigh': 70},
-    {'rsiDipLow': 40, 'rsiDipHigh': 60, 'rsiNowLow': 35, 'rsiNowHigh': 65},
-    {'rsiDipLow': 45, 'rsiDipHigh': 55, 'rsiNowLow': 30, 'rsiNowHigh': 70},
-]
-_QX_K_GRID = [2, 3, 5, 8]
+_QX_MTF_MODES = ['none']  # FIX #27: تم تبسيطه — لا MTF modes (تمت إزالة PRO/MAX)
 
 
 def _qx_build_context(cs):
@@ -3790,29 +3775,8 @@ def _qx_build_context(cs):
             'macd': macd, 'macdSig': msig, 'hi10': hi10, 'lo10': lo10, 'hi5': hi5, 'lo5': lo5, 'vwap': vwap}
 
 
-def _qx_build_max_context(cs):
-    close = [c['close'] for c in cs]; open_ = [c['open'] for c in cs]
-    high = [c['high'] for c in cs]; low = [c['low'] for c in cs]; volume = [c['volume'] for c in cs]
-    ema7 = _qx_ema(close, 7); ema21 = _qx_ema(close, 21); ema200 = _qx_ema(close, 200)
-    rsi = _qx_rsi(close, 14); sma8 = _qx_sma(close, 8)
-    vs = _qx_sma(volume, 20); rvol = [v / vs[i] if vs[i] and vs[i] > 0 else 1.0 for i, v in enumerate(volume)]
-    bbm = _qx_sma(close, 20); bbsd = [None] * len(close)
-    for i in range(len(close)):
-        if i < 19: continue
-        x = close[i - 19:i + 1]; m = bbm[i]
-        if m is None: continue
-        s = sum((v - m) ** 2 for v in x); bbsd[i] = (s / 20.0) ** 0.5
-    bbu = [m + 2 * sd if m is not None and sd is not None else None for m, sd in zip(bbm, bbsd)]
-    bbl = [m - 2 * sd if m is not None and sd is not None else None for m, sd in zip(bbm, bbsd)]
-    hi10 = _qx_rex(high, 10, True); lo10 = _qx_rex(low, 10, False)
-    hi5 = _qx_rex(high, 5, True); lo5 = _qx_rex(low, 5, False); vwap = _qx_vwap(cs)
-    return {'close': close, 'open': open_, 'high': high, 'low': low, 'volume': volume,
-            'ema7': ema7, 'ema21': ema21, 'ema200': ema200, 'rsi': rsi, 'sma8': sma8,
-            'rvol': rvol, 'bbU': bbu, 'bbL': bbl, 'bbMid': bbm, 'hi10': hi10, 'lo10': lo10,
-            'hi5': hi5, 'lo5': lo5, 'vwap': vwap}
-
-
 def _qx_agg(cs, n):
+    """تجميع شموع M1 إلى شموع أعلى (مستخدم فقط في الرسم، ليس في التحليل)."""
     bucket = n * 60; out = []; cur = None; ct = 0
     for c in cs:
         t = (int(c['time']) // bucket) * bucket
@@ -3824,23 +3788,6 @@ def _qx_agg(cs, n):
         cur['close'] = c['close']; cur['volume'] += c['volume']
     if cur: out.append(cur)
     return out
-
-
-def _qx_build_mtf(cs1m):
-    cs5 = _qx_agg(cs1m, 5); cs15 = _qx_agg(cs1m, 15)
-    e5 = _qx_ema([c['close'] for c in cs5], 200); e15 = _qx_ema([c['close'] for c in cs15], 200)
-    n = len(cs1m); t5 = [0] * n; t15 = [0] * n; j5 = 0; j15 = 0
-    for i in range(n):
-        t = cs1m[i]['time']
-        while j5 + 1 < len(cs5) and cs5[j5 + 1]['time'] + 300 <= t: j5 += 1
-        if cs5 and cs5[j5]['time'] + 300 <= t:
-            c5 = cs5[j5]
-            if e5[j5] is not None: t5[i] = 1 if c5['close'] > e5[j5] else (-1 if c5['close'] < e5[j5] else 0)
-        while j15 + 1 < len(cs15) and cs15[j15 + 1]['time'] + 900 <= t: j15 += 1
-        if cs15 and cs15[j15]['time'] + 900 <= t:
-            c15 = cs15[j15]
-            if e15[j15] is not None: t15[i] = 1 if c15['close'] > e15[j15] else (-1 if c15['close'] < e15[j15] else 0)
-    return {'trend5m': t5, 'trend15m': t15}
 
 
 def _qx_expert_cond(c, i):
@@ -3883,65 +3830,6 @@ def _qx_expert_cond(c, i):
     return {'buy': buy, 'sell': sell}
 
 
-def _qx_max_sig(c, i, p, mtf):
-    if i < max(15, p['K'] + 1): return 0
-    ci = c['close'][i]; ri = c['rsi'][i]; rp = c['rsi'][i - 1] if i > 0 else None
-    e200 = c['ema200'][i]; e21 = c['ema21'][i]; e7 = c['ema7'][i]
-    vw = c['vwap'][i]; bbl = c['bbL'][i]; bbu = c['bbU'][i]
-    rdb = False; rra = False
-    for k in range(p['K'] + 1):
-        r = c['rsi'][i - k]
-        if r is not None and r < p['rsiDipLow']: rdb = True
-        if r is not None and r > p['rsiDipHigh']: rra = True
-    tbl = False; tbh = False
-    for k in range(p['K'] + 1):
-        cl = c['close'][i - k]; bl = c['bbL'][i - k]; bu = c['bbU'][i - k]
-        if cl is not None and bl is not None and cl <= bl * 1.001: tbl = True
-        if cl is not None and bu is not None and cl >= bu * 0.999: tbh = True
-    t5 = mtf['trend5m'][i]; t15 = mtf['trend15m'][i]
-    ba = {'trend1m': ci is not None and e200 is not None and ci > e200, 'rsiDip': rdb,
-          'rsiNow': ri is not None and p['rsiNowLow'] < ri < p['rsiNowHigh'],
-          'rsiRising': ri is not None and rp is not None and ri > rp,
-          'vwap': ci is not None and vw is not None and ci > vw, 'bbTouch': tbl,
-          'emaShort': e7 is not None and e21 is not None and e7 > e21, 'mtf5m': t5 == 1, 'mtf15m': t15 == 1}
-    sa = {'trend1m': ci is not None and e200 is not None and ci < e200, 'rsiDip': rra,
-          'rsiNow': ri is not None and p['rsiNowLow'] < ri < p['rsiNowHigh'],
-          'rsiRising': ri is not None and rp is not None and ri < rp,
-          'vwap': ci is not None and vw is not None and ci < vw, 'bbTouch': tbh,
-          'emaShort': e7 is not None and e21 is not None and e7 < e21, 'mtf5m': t5 == -1, 'mtf15m': t15 == -1}
-    req = p['require']
-    ra = [ax for ax in ['rsiDip', 'rsiNow', 'rsiRising', 'vwap', 'bbTouch', 'emaShort', 'trend1m'] if req.get(ax)]
-    if p['mtfMode'] == 'and':
-        ra.extend(['mtf5m', 'mtf15m'])
-        bok = all(ba[ax] for ax in ra); sok = all(sa[ax] for ax in ra)
-        if bok and not sok: return 1
-        if sok and not bok: return -1
-        return 0
-    elif p['mtfMode'] == 'or':
-        bmo = ba['mtf5m'] or ba['mtf15m']; smo = sa['mtf5m'] or sa['mtf15m']
-        bok = all(ba[ax] for ax in ra) and bmo; sok = all(sa[ax] for ax in ra) and smo
-        if bok and not sok: return 1
-        if sok and not bok: return -1
-        return 0
-    else:
-        bok = all(ba[ax] for ax in ra); sok = all(sa[ax] for ax in ra)
-        if bok and not sok: return 1
-        if sok and not bok: return -1
-        return 0
-
-
-def _qx_build_max_params():
-    sets = []
-    for v in _QX_MAX_VARIANTS:
-        for rsi in _QX_RSI_GRID:
-            for K in _QX_K_GRID:
-                for mtf_mode in _QX_MTF_MODES:
-                    sets.append({'variant': v['name'], 'require': v['require'], 'K': K, 'mtfMode': mtf_mode,
-                                 'rsiDipLow': rsi['rsiDipLow'], 'rsiDipHigh': rsi['rsiDipHigh'],
-                                 'rsiNowLow': rsi['rsiNowLow'], 'rsiNowHigh': rsi['rsiNowHigh'], 'volMin': 0.5})
-    return sets
-
-
 def _qx_score(events, cs_len):
     direct = sum(1 for e in events if e['outcome'] == 1)
     mtg = sum(1 for e in events if e['outcome'] == 2)
@@ -3978,54 +3866,12 @@ def _qx_bt_quantvexa(cs, ctx, strategy, mask, start):
     r = _qx_score(events, len(cs)); r.update({'strategy': strategy, 'mask': mask, 'mtfMode': 'none'}); return r
 
 
-def _qx_bt_pro(cs, ctx, mtf, strategy, mask, mtf_mode, start):
-    events = []; ls = -999
-    for i in range(max(205, start), len(cs) - 2):
-        if i - ls < 1: continue
-        q = _qx_expert_cond(ctx, i); ema = bool(mask & 1); rsi = bool(mask & 2); vol = bool(mask & 4)
-        ci = ctx['close'][i]; ri = ctx['rsi'][i]; rvi = ctx['rvol'][i]; e200i = ctx['ema200'][i]
-        pb = ((not ema or (ci is not None and e200i is not None and ci > e200i)) and (not rsi or (ri is not None and 35 <= ri <= 75)) and (not vol or (rvi is not None and rvi >= 0.5)))
-        ps = ((not ema or (ci is not None and e200i is not None and ci < e200i)) and (not rsi or (ri is not None and 25 <= ri <= 65)) and (not vol or (rvi is not None and rvi >= 0.5)))
-        if q['buy'][strategy] and pb: d = 1
-        elif q['sell'][strategy] and ps: d = -1
-        else: d = 0
-        if d != 0 and mtf_mode != 'none':
-            t5 = mtf['trend5m'][i]; t15 = mtf['trend15m'][i]
-            if mtf_mode == 'and':
-                if d > 0 and not (t5 == 1 and t15 == 1): d = 0
-                if d < 0 and not (t5 == -1 and t15 == -1): d = 0
-            elif mtf_mode == 'or':
-                if d > 0 and not (t5 == 1 or t15 == 1): d = 0
-                if d < 0 and not (t5 == -1 or t15 == -1): d = 0
-        if d == 0: continue
-        ls = i; n1 = cs[i + 1]; n2 = cs[i + 2]
-        if d > 0: w1 = n1['close'] >= n1['open']; w2 = n2['close'] >= n2['open']
-        else: w1 = n1['close'] <= n1['open']; w2 = n2['close'] <= n2['open']
-        if w1: oc, ri2 = 1, i + 1
-        elif w2: oc, ri2 = 2, i + 2
-        else: oc, ri2 = -1, i + 2
-        events.append({'i': i, 'dir': d, 'outcome': oc, 'resultIndex': ri2})
-    r = _qx_score(events, len(cs)); r.update({'strategy': strategy, 'mask': mask, 'mtfMode': mtf_mode}); return r
-
-
-def _qx_bt_max(cs, ctx, mtf, params, start):
-    events = []; ls = -999
-    for i in range(max(205, start), len(cs) - 2):
-        if i - ls < 1: continue
-        d = _qx_max_sig(ctx, i, params, mtf)
-        if d == 0: continue
-        ls = i; n1 = cs[i + 1]; n2 = cs[i + 2]
-        if d > 0: w1 = n1['close'] >= n1['open']; w2 = n2['close'] >= n2['open']
-        else: w1 = n1['close'] <= n1['open']; w2 = n2['close'] <= n2['open']
-        if w1: oc, ri2 = 1, i + 1
-        elif w2: oc, ri2 = 2, i + 2
-        else: oc, ri2 = -1, i + 2
-        events.append({'i': i, 'dir': d, 'outcome': oc, 'resultIndex': ri2})
-    r = _qx_score(events, len(cs)); r.update({'params': params}); return r
-
-
 def qx_decide_direction(candles, mode='quantvexa', window=120):
-    """Run BADICHARTS engine on real candles.
+    """Run BADICHARTS engine (Quantex Expert V1) on real candles.
+
+    FIX #27: تمت إزالة أوضاع PRO و MAX بناءً على طلب المستخدم.
+    الآن الدالة تطبّق فقط الاستراتيجية الأصلية (Quantex Expert V1)
+    المطابقة لكود JavaScript 100%.
 
     Returns:
         tuple (direction, strength)
@@ -4043,42 +3889,24 @@ def qx_decide_direction(candles, mode='quantvexa', window=120):
     cs = candles; n = len(cs)
     start = max(0, n - window) if window > 0 else 0; cur = n - 2  # last CLOSED candle
     if cur < 205: cur = 205
-    firing_cfg = None  # FIX #1: track which config actually fires
-    if mode == 'max':
-        ctx = _qx_build_max_context(cs); mtf = _qx_build_mtf(cs)
-        ps = _qx_build_max_params(); results = [_qx_bt_max(cs, ctx, mtf, p, start) for p in ps]
-        results.sort(key=lambda x: -x['score'])
-        elig = [x for x in results if x['total'] >= 8]; best = elig[0] if elig else results[0]
-        d = _qx_max_sig(ctx, cur, best['params'], mtf)
-        if d != 0: firing_cfg = best
-        strength = int(firing_cfg['rate']) if firing_cfg and 'rate' in firing_cfg else 0
-        return ('BUY' if d == 1 else ('SELL' if d == -1 else None)), strength
     ctx = _qx_build_context(cs)
-    if mode == 'pro':
-        mtf = _qx_build_mtf(cs); results = []
-        for st in range(12):
-            for mask in range(8):
-                for mm in _QX_MTF_MODES: results.append(_qx_bt_pro(cs, ctx, mtf, st, mask, mm, start))
-    else:
-        results = []
-        for st in range(12):
-            for mask in range(8): results.append(_qx_bt_quantvexa(cs, ctx, st, mask, start))
+    # اختبار 12 استراتيجية × 8 فلاتر = 96 تكوين (مطابق لـ JavaScript)
+    results = []
+    for st in range(12):
+        for mask in range(8):
+            results.append(_qx_bt_quantvexa(cs, ctx, st, mask, start))
     results.sort(key=lambda x: -x['score'])
     elig = [x for x in results if x['total'] >= 8]
     candidates = elig if elig else results
     q = _qx_expert_cond(ctx, cur)
     # ── ITERATE THROUGH CONFIGS IN SCORE ORDER ──
-    # The previous logic checked ONLY the single best config. If that config's
-    # strategy was biased toward SELL (e.g., in a downtrending market), the
-    # engine would only produce SELL signals. Now we iterate through ALL
-    # high-scoring configs (sorted by score, descending) and return the FIRST
-    # one that fires at the current candle. This:
-    #   1. Still prefers higher-scoring configs (better historical accuracy)
-    #   2. Produces more signals (not limited to one config's signal)
-    #   3. Allows BOTH BUY and SELL signals (different strategies fire at
-    #      different times, so the engine naturally produces both directions)
+    # نكرر على كل configs مرتبة حسب score (تنازلياً) ونعيد أول إشارة فعلية.
+    # هذا:
+    #   1. يفضّل configs الأعلى score (دقة تاريخية أفضل)
+    #   2. ينتج إشارات أكثر (لا يقتصر على config واحد)
+    #   3. يسمح بإشارات BUY و SELL معاً (استراتيجيات مختلفة تطلق في أوقات مختلفة)
     d = 0
-    cfg = None  # FIX #4: track the firing config explicitly
+    cfg = None
     for cfg in candidates:
         strat = cfg['strategy']; mask = cfg['mask']
         ema = bool(mask & 1); rsi = bool(mask & 2); vol = bool(mask & 4)
@@ -4089,23 +3917,7 @@ def qx_decide_direction(candles, mode='quantvexa', window=120):
             d = 1; break
         if q['sell'][strat] and ps:
             d = -1; break
-    # FIX #4: check mtfMode on the FIRING config (cfg), not candidates[0].
-    # The previous bug: when checking `candidates[0].get('mtfMode')` we might
-    # enable MTF filtering based on a different config than the one that
-    # actually fired, causing wrong rejections or wrong approvals.
-    if d != 0 and mode == 'pro' and cfg is not None and cfg.get('mtfMode', 'none') != 'none':
-        mm = cfg.get('mtfMode', 'none')
-        t5 = mtf['trend5m'][cur]; t15 = mtf['trend15m'][cur]
-        if mm == 'and':
-            if d > 0 and not (t5 == 1 and t15 == 1): d = 0
-            if d < 0 and not (t5 == -1 and t15 == -1): d = 0
-        elif mm == 'or':
-            if d > 0 and not (t5 == 1 or t15 == 1): d = 0
-            if d < 0 and not (t5 == -1 or t15 == -1): d = 0
-    # FIX #1: derive strength from REAL backtest win rate of the firing config,
-    # not from random.randint(85, 99). If a config has rate=72.3 in backtest,
-    # strength=72. This makes the displayed "Strength %" actually mean
-    # something instead of being decorative noise.
+    # strength = نسبة الفوز الفعلية للـ config الذي أطلق الإشارة
     firing_cfg = cfg if d != 0 else None
     strength = int(firing_cfg['rate']) if firing_cfg and 'rate' in firing_cfg else 0
     return ('BUY' if d == 1 else ('SELL' if d == -1 else None)), strength
@@ -4535,10 +4347,9 @@ PAIR_BASE_PRICES = {
     "USDZAR_otc": 18.5,
 }
 
+# FIX #27: تمت إزالة أوضاع PRO و MAX. الآن يوجد فقط BADICHARTS (Quantex Expert V1)
 STRATEGY_INFO = {
     "quantvexa": {"name": "BADICHARTS", "accuracy": "96.5%", "emoji": ""},
-    "pro":       {"name": "BADICHARTS-PRO", "accuracy": "88.3%", "emoji": ""},
-    "max":       {"name": "BADICHARTS-MAX", "accuracy": "82.2%", "emoji": ""},
 }
 
 STATS = {"wins": 0, "losses": 0}
@@ -5051,18 +4862,12 @@ def build_signal(direction=None, symbol=None, payout=None, display_candles=None,
 # ============================================================================
 
 def build_strategy_keyboard():
-    """3 strategy buttons: 2 on top + 1 below.
-    Uses KeyboardButtonStyle for NATIVE colored backgrounds:
-      - PRIMARY (blue)  = best accuracy (BADICHARTS 96.5%)
-      - SUCCESS (green) = more signals (BADICHARTS-PRO, BADICHARTS-MAX)
+    """FIX #27: زر استراتيجية واحد فقط — BADICHARTS (Quantex Expert V1).
+    تمت إزالة أزرار PRO و MAX.
     """
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("BADICHARTS  96.5%", callback_data="strat:quantvexa", style=STYLE_BLUE),
-            InlineKeyboardButton("BADICHARTS-PRO  88.3%", callback_data="strat:pro", style=STYLE_GREEN),
-        ],
-        [
-            InlineKeyboardButton("BADICHARTS-MAX  82.2%", callback_data="strat:max", style=STYLE_GREEN),
         ],
     ])
 
