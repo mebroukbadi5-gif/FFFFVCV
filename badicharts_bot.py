@@ -4833,6 +4833,16 @@ def render_signal_chart(candles, symbol, direction, payout=None, entry_time=None
     bg.add_patch(Polygon(_bd_pts(AX_X+AX_W+6, yy-14, 82, 28, 8), closed=True, facecolor=BLUE, edgecolor="none", zorder=8))
     _bd_t(bg, AX_X+AX_W+47, yy, _bd_fmt(cur), 9.5, "#FFFFFF", ha="center", family=MONO, z=9)
     s_i = nb-1
+    # FIX #22: للإشارة الجديدة (PENDING) قبل ظهور النتيجة، ارسم السهم على
+    # شمعة n-2 (آخر شمعة مغلقة)، وليس على شمعة n-1 (الشمعة الحية التي
+    # ما زالت تتشكل). المحرك يُحلل عند cur = n-2، فالسهم يجب أن يكون
+    # على نفس الشمعة. خط ENTRY يبقى عند nb-0.5 (يمين آخر شمعة = entry).
+    # لحالة RESULT، السهم يبقى على nb-1 (آخر شمعة من base = شمعة الإشارة).
+    if not is_result:
+        s_i = nb - 2  # PENDING: السهم على آخر شمعة مغلقة
+    # else: s_i = nb - 1 (RESULT: السهم على شمعة الإشارة قبل entry candle)
+    if s_i < 0:
+        s_i = 0  # حماية من قائمة شموع صغيرة جداً
     if is_buy: tip, bpos, mk, va = l[s_i]-span*0.06, l[s_i]-span*0.15, "^", "top"
     else: tip, bpos, mk, va = h[s_i]+span*0.06, h[s_i]+span*0.15, "v", "bottom"
     ax.plot([s_i],[tip], marker=mk, markersize=14, color=dcol, zorder=9, clip_on=False, path_effects=[pe.Stroke(linewidth=10, foreground=dcol, alpha=0.28), pe.Normal()])
@@ -5659,12 +5669,11 @@ async def _bd_send_signal_to(chat_id, context, symbol=None, direction=None, chec
         if live_price is not None:
             sig["live_price"] = live_price
             print(f"LIVE PRICE {symbol}: {live_price:.5f}")
-        # FIX #22: ارسم الإشارة على الشمعة التي ظهرت عليها الإشارة (n-2)،
-        # وليس على الشمعة الأخيرة (n-1) التي هي شمعة جديدة لم تتشكل بعد.
-        # المحرك يُحلل عند cur = n-2 (آخر شمعة مغلقة)، فالسهم يجب أن يكون
-        # على نفس الشمعة. n_base = len-1 يجعل s_i = nb-1 = len-2. ✓
-        n_base_for_chart = len(sig["candles"]) - 1
-        png = await _bd_render(**_bd_render_kwargs(sig, sig["candles"], "PENDING", n_base_for_chart))
+        # FIX #22 (revised): استخدم n_base = len(candles) للحفاظ على خط ENTRY
+        # في مكانه الصحيح (يمين آخر شمعة = entry point).
+        # السهم يُرسم على شمعة n-2 (المغلقة) داخل دالة render_signal_chart
+        # عبر فحص status == "PENDING". هذا يفصل موضع السهم عن موضع خط ENTRY.
+        png = await _bd_render(**_bd_render_kwargs(sig, sig["candles"], "PENDING", len(sig["candles"])))
     except Exception as e:
         print(f"ERROR building payload: {e}")
         return False
