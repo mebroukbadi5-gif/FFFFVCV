@@ -4144,26 +4144,19 @@ class LiveCandleProvider:
         self.live_subscriber: Optional[LivePriceSubscriber] = None
         self._lock = asyncio.Lock()
         self._is_connecting = False
-        # Candle cache: asset → (fetch_timestamp, candles_list)
-        # FIX #18: الكاش القديم كان 5 ثوانٍ فقط — هذا كان يجبر البوت على
-        # إعادة جلب 250 شمعة لكل زوج في كل دورة تحليل، مما يسبب:
-        #   - بطء شديد (4-8s لكل زوج × 13 زوج = 50-100s لكل دورة)
-        #   - ضغط على خادم Quotex
-        #   - استنزاف الباندويث
-        #   - احتمال حظر الـ IP
-        # زيادة الـ TTL إلى 30 ثانية يعني:
-        #   - عند تحليل 13 زوج بالتوازي، الكاش يبقى صالحاً طوال الـ analysis
-        #   - كل زوج يُجلب مرة واحدة فقط (وليس 13 مرة)
-        #   - عند الحاجة لشمعة جديدة (entry/martingale)، الكود يحذف الكاش
-        #     يدوياً قبل الجلب (موجود بالفعل في _bd_signal_lifecycle)
-        # 30s آمن لأن:
-        #   - شمعة M1 تُغلق كل 60s، فالكاش 30s يضمن أن الشمعة الأخيرة
-        #     في الكاش لا تتعدى عمرها 30s (أي أحدث من نصف شمعة)
-        #   - عند جلب شمعة المارتينجال، الكود يحذف الكاش يدوياً
-        #     (candle_provider._candles_cache.pop) قبل الجلب، فلا توجد
-        #     مشكلة في استخدام بيانات قديمة
+        # FIX #21: current_candles = الشموع الحية المُحدَّثة بالـ ticks في الوقت الفعلي.
+        # بدلاً من إعادة جلب 250 شمعة من Quotex في كل مرة (بطيء)، نُحدّث الشمعة
+        # الأخيرة مباشرة من الـ ticks الواردة عبر WebSocket. هذا يعني:
+        #   - جلب تاريخي مرة واحدة عند البدء (250 شمعة)
+        #   - كل tick يُحدّث الشمعة الحالية (close, high, low)
+        #   - عند بدء دقيقة جديدة → شمعة جديدة تُضاف
+        #   - التحليل دائماً يستخدم أحدث البيانات (لا تأخير!)
+        #   - لا حاجة لانتظار 3 ساعات لتجميع 210 شموع من ticks
+        self.current_candles: Dict[str, List[Dict]] = {}
+        self._candles_lock = threading.Lock()
+        # Candle cache (legacy, used as fallback)
         self._candles_cache: Dict[str, Tuple[float, List[Dict]]] = {}
-        self._cache_ttl = 30.0  # seconds (was 5.0 — too short, caused re-fetching)
+        self._cache_ttl = 30.0
         # FIX #20: مرجع للـ event loop و thread الذي يشغّل مهام Quotex في الخلفية.
         # يُستخدم في _connect_quotex_blocking لتشغيل loop.run_forever() في thread
         # منفصل، بحيث تستمر مهام WebSocket و keepalive في العمل حتى بعد بدء البوت.
@@ -4234,73 +4227,123 @@ class LiveCandleProvider:
             finally:
                 self._is_connecting = False
 
+    def _update_candles_from_ticks(self):
+        """FIX #21: حدّث current_candles من الـ ticks المُخزَّنة في buffer.
+        
+        هذه الدالة تُستدعى من keep_alive_loop كل بضع ثوانٍ. تقوم بـ:
+          1. قراءة الـ ticks الجديدة من tick_buffer
+          2. تحديث الشمعة الأخيرة (close, high, low) من كل tick
+          3. إنشاء شمعة جديدة عند بدء دقيقة جديدة
+          4. الحفاظ على آخر 300 شمعة فقط
+        
+        هذا يعني أن current_candles دائماً يحتوي على أحدث البيانات،
+        ولا حاجة لإعادة جلب الشموع التاريخية في كل مرة.
+        """
+        if self.interceptor is None:
+            return
+        for asset in OTC_ASSETS:
+            with self.interceptor._ticks_lock:
+                ticks = list(self.interceptor.tick_buffer.get(asset, []))
+                if ticks:
+                    # مسح الـ ticks المعالجة
+                    self.interceptor.tick_buffer[asset].clear()
+            if not ticks:
+                continue
+            with self._candles_lock:
+                candles = self.current_candles.get(asset, [])
+                if not candles:
+                    # لا توجد شموع أساسية بعد — نحتاج جلب تاريخي أولاً
+                    continue
+                # معالجة كل tick
+                for ts, price in ticks:
+                    bucket = (int(ts) // 60) * 60
+                    last = candles[-1] if candles else None
+                    if last and last['time'] == bucket:
+                        # تحديث الشمعة الحالية
+                        last['close'] = price
+                        if price > last['high']:
+                            last['high'] = price
+                        if price < last['low']:
+                            last['low'] = price
+                        last['volume'] = last.get('volume', 0) + 1
+                    elif (not last) or bucket > last['time']:
+                        # دقيقة جديدة → شمعة جديدة
+                        candles.append({
+                            'time': bucket,
+                            'open': price,
+                            'high': price,
+                            'low': price,
+                            'close': price,
+                            'volume': 1,
+                        })
+                        # الحفاظ على آخر 300 شمعة فقط
+                        while len(candles) > 300:
+                            candles.pop(0)
+                self.current_candles[asset] = candles
+
     async def fetch_candles(self, asset: str, count: int = 250,
                             timeframe_min: int = 1,
                             force_historical: bool = False) -> Optional[List[Dict]]:
-        """Fetch candles for the given OTC asset.
-
-        FIX #19: استراتيجية من 3 طبقات (الأسرع أولاً):
-          1) الكاش (إذا كان صالحاً و > 210 شموع)
-          2) الشموع المُجمَّعة محلياً من الـ ticks اللحظية (فوري، لا شبكة)
-          3) الجلب التاريخي من Quotex (fallback، 4-8s لكل زوج)
-
-        Args:
-            count: عدد الشموع المطلوبة (افتراضي 250)
-            timeframe_min: الطابع الزمني (M1 فقط مدعوم عبر ticks اللحظية)
-            force_historical: True لتخطي الشموع المحلية (يستخدم في النتائج)
+        """Fetch candles — FIX #21: استخدم current_candles أولاً (مُحدَّث بالـ ticks).
+        
+        الأولوية:
+          1) current_candles (مُحدَّث بالـ ticks في الوقت الفعلي — فوري!)
+          2) الكاش (30s TTL)
+          3) الجلب التاريخي من Quotex (fallback، مرة واحدة فقط)
+        
+        بعد الجلب التاريخي، نخزّن النتيجة في current_candles ليتم
+        تحديثها بالـ ticks لاحقاً — لا حاجة لإعادة الجلب أبداً (إلا عند
+        انقطاع الاتصال).
         """
-        # ── Layer 1: الكاش ──
+        # ── Layer 1: current_candles (الأفضل — مُحدَّث بالـ ticks) ──
+        if not force_historical and timeframe_min == 1:
+            with self._candles_lock:
+                candles = list(self.current_candles.get(asset, []))
+            if candles and len(candles) >= 210:
+                # لدينا شموع كافية ومُحدَّثة بالـ ticks — استخدمها مباشرة!
+                if len(candles) > count:
+                    candles = candles[-count:]
+                return candles
+
+        # ── Layer 2: الكاش (للطلبات قصيرة المدى) ──
         now = time.time()
         cached = self._candles_cache.get(asset)
         if cached is not None:
-            fetch_ts, candles = cached
-            if now - fetch_ts < self._cache_ttl and len(candles) >= 210:
-                return candles  # reuse cached candles
+            fetch_ts, cached_candles = cached
+            if now - fetch_ts < self._cache_ttl and len(cached_candles) >= 210:
+                # حدّث current_candles من الكاش (لو لم يكن موجوداً)
+                if asset not in self.current_candles:
+                    with self._candles_lock:
+                        self.current_candles[asset] = list(cached_candles)
+                return cached_candles
 
-        # ── Layer 2: الشموع المحلية من الـ ticks (FIX #19) ──
-        # الـ ticks تُجمَّع في شموع M1 محلياً من WebSocket — فوري ولا شبكة.
-        # نستخدمها فقط إذا كان timeframe_min == 1 (M1) ولطلب التحليل العادي
-        # (وليس جلب النتائج، حيث نحتاج شمعة محددة من Quotex).
-        if not force_historical and timeframe_min == 1 and self.interceptor is not None:
-            try:
-                local_candles = self.interceptor.get_local_candles(asset, count=count + 50)
-                if local_candles and len(local_candles) >= 210:
-                    # نجح التجميع المحلي — استخدمه مباشرة بدون جلب تاريخي!
-                    # إضافة كلمة "LIVE" في الـ log للتفريق بين المصدرين
-                    print(f"FETCH {asset}: ✓ using LOCAL tick-aggregated candles "
-                          f"({len(local_candles)} candles from "
-                          f"{self.interceptor.get_tick_count(asset)} ticks)")
-                    if len(local_candles) > count:
-                        local_candles = local_candles[-count:]
-                    # خزّنه في الكاش لتفادي إعادة التجميع في الاستدعاءات القادمة
-                    self._candles_cache[asset] = (time.time(), local_candles)
-                    return local_candles
-                elif local_candles:
-                    print(f"FETCH {asset}: only {len(local_candles)} local candles (need ≥210), "
-                          f"falling back to historical fetch...")
-                else:
-                    print(f"FETCH {asset}: no local ticks yet, falling back to historical fetch...")
-            except Exception as e:
-                print(f"FETCH {asset}: local aggregation error: {e}, falling back...")
-
-        # ── Layer 3: الجلب التاريخي من Quotex (fallback) ──
+        # ── Layer 3: الجلب التاريخي من Quotex (fallback — مرة واحدة) ──
         if not await self._ensure_connected():
             return None
         if self.fetcher is None:
             return None
         try:
-            # Suppress all output from the fetcher
             import io as _io, contextlib as _ctxlib
             with _ctxlib.redirect_stdout(_io.StringIO()):
-                candles = await self.fetcher.fetch_exactly_n(asset, timeframe_min, count, progress=False)
+                candles = await asyncio.wait_for(
+                    self.fetcher.fetch_exactly_n(asset, timeframe_min, count, progress=False),
+                    timeout=60.0  # FIX: timeout لمنع التعليق
+                )
+        except asyncio.TimeoutError:
+            print(f"FETCH {asset}: historical fetch timed out after 60s")
+            return None
         except Exception as e:
+            print(f"FETCH {asset}: historical fetch error: {e}")
             return None
         if not candles or len(candles) < 210:
             return None
         # Truncate to last `count`
         if len(candles) > count:
             candles = candles[-count:]
-        # Store in cache
+        # FIX #21: خزّن في current_candles ليتم تحديثها بالـ ticks لاحقاً
+        with self._candles_lock:
+            self.current_candles[asset] = list(candles)
+        # Store in cache too
         self._candles_cache[asset] = (time.time(), candles)
         return candles
 
@@ -4346,22 +4389,25 @@ class LiveCandleProvider:
                 pass  # silent
 
     async def keep_alive_loop(self):
-        """Background task that keeps live prices flowing.
+        """Background task that keeps live prices flowing AND updates candles.
 
-        Re-subscribes to live prices and refreshes payouts periodically, exactly
-        like mega_fetch's LIVE PRICE LOOP:
-          - Re-subscribe to live prices every 30s (subscriptions can expire)
-          - Refresh payouts every 60s
-        This ensures get_live_price() always returns a FRESH price, not a stale
-        one from minutes ago.
+        FIX #21: أضفنا استدعاء _update_candles_from_ticks كل 2 ثانية.
+        هذا يضمن أن current_candles دائماً مُحدَّث بالـ ticks اللحظية،
+        فلا حاجة لإعادة جلب الشموع التاريخية في كل تحليل.
         """
         last_resubscribe = 0.0
         last_refresh = 0.0
+        last_tick_update = 0.0
         resubscribe_interval = 30.0
         refresh_interval = 60.0
+        tick_update_interval = 2.0  # FIX #21: حدّث الشموع كل 2 ثانية
         while True:
             try:
                 now = time.time()
+                # FIX #21: حدّث current_candles من الـ ticks (الأهم!)
+                if now - last_tick_update >= tick_update_interval:
+                    self._update_candles_from_ticks()
+                    last_tick_update = now
                 # Re-subscribe to live prices (sends depth/follow + instruments/update)
                 if now - last_resubscribe >= resubscribe_interval:
                     if self.live_subscriber is not None:
@@ -4905,10 +4951,17 @@ def build_signal(direction=None, symbol=None, payout=None, display_candles=None,
     if display_candles is None:
         raise ValueError("build_signal requires display_candles from Quotex")
     candles = [dict(c) for c in display_candles]
-    # FIX #3: do NOT fabricate fake random volumes — use 1.0 (neutral).
+    # FIX #23: مؤشر الفوليوم — استخدم متوسط الفوليوم الحقيقي للشموع ذات
+    # الفوليوم المفقود (0 أو None)، بدلاً من 1.0 الذي يجعلها غير مرئية.
+    # السبب: الشموع التاريخية من Quotex لها فوليوم حقيقي (100-2000)، بينما
+    # الشموع المُجمَّعة من ticks لها فوليوم صغير (1-50). لو وضعنا 1.0
+    # للشموع ذات الفوليوم المفقود، تصبح أشرطة الفوليوم غير مرئية مقارنة
+    # بالشموع ذات الفوليوم الكبير. الحل: استخدم متوسط الفوليوم الحقيقي.
+    real_volumes = [c.get('volume', 0) for c in candles if c.get('volume', 0) > 0]
+    avg_volume = sum(real_volumes) / len(real_volumes) if real_volumes else 100
     for c in candles:
-        if not c.get('volume'):
-            c['volume'] = 1.0
+        if not c.get('volume') or c['volume'] == 0:
+            c['volume'] = int(avg_volume)
     # entry_time = the START of the NEXT minute boundary, computed from CURRENT TIME.
     # We do NOT use candle timestamps because:
     #   1. Quotex returns the live candle's start timestamp, which may already be
@@ -5115,19 +5168,46 @@ async def _bd_signal_lifecycle(bot, chat_id, sig, message):
 
         # ── FETCH REAL RESULT CANDLES FROM QUOTEX ──
         # Fetch fresh candles to get the ACTUAL entry candle data.
-        # IMPORTANT: bypass the cache by clearing it for this asset, so we
-        # always get the LATEST candles (including the just-closed entry candle).
+        # FIX #24: إضافة timeout صارم لمنع التعليق عند "Waiting for result... 00s".
+        # المشكلة السابقة: fetch_candles كان يستغرق وقتاً طويلاً أو يعطّل،
+        # فتبقى رسالة "Waiting for result... 00s" عالقة بدون نتيجة.
+        # الحل: timeout 20s + fallback لـ current_candles (المُحدَّث بالـ ticks).
+        real_result_candles = None
         if candle_provider is not None:
+            # أولاً: حاول استخدام current_candles (سريع — لا شبكة)
+            # الـ ticks كانت تُحدّث current_candles كل 2 ثانية،所以 قد تحتوي
+            # على شمعة الإدخال بالفعل!
             try:
-                # Clear cache to force fresh fetch (the entry candle JUST closed)
-                candle_provider._candles_cache.pop(sig["symbol"], None)
-                # FIX #19: استخدم force_historical=True لجلب النتائج، لأننا
-                # نحتاج شمعة الإدخال المغلقة (entry candle) التي قد تكون أحدث
-                # من الـ ticks المُخزّنة محلياً (الـ ticks تحتاج وقتاً لتصل).
-                real_result_candles = await candle_provider.fetch_candles(
-                    sig["symbol"], count=10, timeframe_min=1, force_historical=True)
+                with candle_provider._candles_lock:
+                    cc = list(candle_provider.current_candles.get(sig["symbol"], []))
+                if cc:
+                    # ابحث عن شمعة الإدخال في current_candles
+                    entry_ts_check = int(sig["entry_time"].timestamp())
+                    for c in cc:
+                        if abs(int(c['time']) - entry_ts_check) <= 2:
+                            real_result_candles = cc
+                            print(f"LIFECYCLE: ✓ found entry candle in current_candles (no fetch needed!)")
+                            break
             except Exception:
-                real_result_candles = None
+                pass
+            # ثانياً: لو لم نجدها في current_candles، استخدم force_historical مع timeout
+            if real_result_candles is None:
+                try:
+                    candle_provider._candles_cache.pop(sig["symbol"], None)
+                    real_result_candles = await asyncio.wait_for(
+                        candle_provider.fetch_candles(
+                            sig["symbol"], count=10, timeframe_min=1, force_historical=True),
+                        timeout=20.0
+                    )
+                except asyncio.TimeoutError:
+                    print(f"LIFECYCLE: fetch_candles timed out after 20s — using current_candles as fallback")
+                    # fallback: استخدم current_candles حتى لو لم نجد شمعة الإدخال بالضبط
+                    with candle_provider._candles_lock:
+                        real_result_candles = list(candle_provider.current_candles.get(sig["symbol"], []))
+                except Exception as e:
+                    print(f"LIFECYCLE: fetch_candles error: {e}")
+                    with candle_provider._candles_lock:
+                        real_result_candles = list(candle_provider.current_candles.get(sig["symbol"], []))
 
         # Find the entry candle in the real data
         # Entry candle = the candle whose time EXACTLY matches sig["entry_time"].
@@ -5235,14 +5315,37 @@ async def _bd_signal_lifecycle(bot, chat_id, sig, message):
             # القديم: count=10 كان يجلب آخر 10 شموع فقط. لو كانت هناك مشكلة
             # تأخير في الجلب، شمعة المارتينجال قد لا تكون ضمن آخر 10.
             # count=30 يعطي هامش أمان أكبر بكير.
+            # FIX #24: إضافة timeout لمنع التعليق
             mtg_candles = None
             if candle_provider is not None:
+                # أولاً: حاول current_candles (سريع)
                 try:
-                    candle_provider._candles_cache.pop(sig["symbol"], None)
-                    mtg_candles = await candle_provider.fetch_candles(
-                        sig["symbol"], count=30, timeframe_min=1, force_historical=True)
+                    with candle_provider._candles_lock:
+                        cc2 = list(candle_provider.current_candles.get(sig["symbol"], []))
+                    if cc2:
+                        mtg_ts_check = entry_ts + CANDLE_SECONDS
+                        for c in cc2:
+                            if abs(int(c['time']) - mtg_ts_check) <= 5:
+                                mtg_candles = cc2
+                                print(f"LIFECYCLE: ✓ found martingale candle in current_candles")
+                                break
                 except Exception:
                     pass
+                # ثانياً: fallback للجلب التاريخي مع timeout
+                if mtg_candles is None:
+                    try:
+                        candle_provider._candles_cache.pop(sig["symbol"], None)
+                        mtg_candles = await asyncio.wait_for(
+                            candle_provider.fetch_candles(
+                                sig["symbol"], count=30, timeframe_min=1, force_historical=True),
+                            timeout=20.0
+                        )
+                    except asyncio.TimeoutError:
+                        print(f"LIFECYCLE: martingale fetch timed out after 20s — using current_candles")
+                        with candle_provider._candles_lock:
+                            mtg_candles = list(candle_provider.current_candles.get(sig["symbol"], []))
+                    except Exception:
+                        pass
 
             # Find the martingale candle (entry + 1 minute)
             # CRITICAL: ±2s tolerance only, and EXCLUDE the last (live) candle.
@@ -5556,7 +5659,12 @@ async def _bd_send_signal_to(chat_id, context, symbol=None, direction=None, chec
         if live_price is not None:
             sig["live_price"] = live_price
             print(f"LIVE PRICE {symbol}: {live_price:.5f}")
-        png = await _bd_render(**_bd_render_kwargs(sig, sig["candles"], "PENDING", len(sig["candles"])))
+        # FIX #22: ارسم الإشارة على الشمعة التي ظهرت عليها الإشارة (n-2)،
+        # وليس على الشمعة الأخيرة (n-1) التي هي شمعة جديدة لم تتشكل بعد.
+        # المحرك يُحلل عند cur = n-2 (آخر شمعة مغلقة)، فالسهم يجب أن يكون
+        # على نفس الشمعة. n_base = len-1 يجعل s_i = nb-1 = len-2. ✓
+        n_base_for_chart = len(sig["candles"]) - 1
+        png = await _bd_render(**_bd_render_kwargs(sig, sig["candles"], "PENDING", n_base_for_chart))
     except Exception as e:
         print(f"ERROR building payload: {e}")
         return False
