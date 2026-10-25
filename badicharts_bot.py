@@ -4235,31 +4235,29 @@ class LiveCandleProvider:
           2. تحديث الشمعة الأخيرة (close, high, low) من كل tick
           3. إنشاء شمعة جديدة عند بدء دقيقة جديدة
           4. الحفاظ على آخر 300 شمعة فقط
+          5. FIX #26: ضمان وجود شمعة حية للدقيقة الحالية دائماً
         
         هذا يعني أن current_candles دائماً يحتوي على أحدث البيانات،
         ولا حاجة لإعادة جلب الشموع التاريخية في كل مرة.
         """
         if self.interceptor is None:
             return
+        now_ts = time.time()
+        current_minute_bucket = (int(now_ts) // 60) * 60
         for asset in OTC_ASSETS:
             with self.interceptor._ticks_lock:
                 ticks = list(self.interceptor.tick_buffer.get(asset, []))
                 if ticks:
-                    # مسح الـ ticks المعالجة
                     self.interceptor.tick_buffer[asset].clear()
-            if not ticks:
-                continue
             with self._candles_lock:
                 candles = self.current_candles.get(asset, [])
                 if not candles:
-                    # لا توجد شموع أساسية بعد — نحتاج جلب تاريخي أولاً
                     continue
                 # معالجة كل tick
                 for ts, price in ticks:
                     bucket = (int(ts) // 60) * 60
                     last = candles[-1] if candles else None
                     if last and last['time'] == bucket:
-                        # تحديث الشمعة الحالية
                         last['close'] = price
                         if price > last['high']:
                             last['high'] = price
@@ -4267,18 +4265,35 @@ class LiveCandleProvider:
                             last['low'] = price
                         last['volume'] = last.get('volume', 0) + 1
                     elif (not last) or bucket > last['time']:
-                        # دقيقة جديدة → شمعة جديدة
                         candles.append({
-                            'time': bucket,
-                            'open': price,
-                            'high': price,
-                            'low': price,
-                            'close': price,
-                            'volume': 1,
+                            'time': bucket, 'open': price, 'high': price,
+                            'low': price, 'close': price, 'volume': 1,
                         })
-                        # الحفاظ على آخر 300 شمعة فقط
                         while len(candles) > 300:
                             candles.pop(0)
+                # FIX #26: ضمان وجود شمعة حية للدقيقة الحالية.
+                # لو آخر شمعة أقدم من الدقيقة الحالية، نُضيف شمعة حية
+                # باستخدام آخر سعر متاح (من live_prices أو آخر close).
+                # هذا يضمن أن:
+                #   - candles[-1] = الشمعة الحية (الدقيقة الحالية)
+                #   - candles[-2] = آخر شمعة مغلقة
+                # فالمحرك يحلل عند n-2 (آخر مغلقة) ✓
+                # والسهم يُرسم عند n-2 (آخر مغلقة) ✓
+                last_candle = candles[-1] if candles else None
+                if last_candle and last_candle['time'] < current_minute_bucket:
+                    # استخدم آخر سعر متاح (live price أو close آخر شمعة)
+                    live_price = self.interceptor.live_prices.get(asset)
+                    seed_price = live_price if live_price is not None else last_candle['close']
+                    candles.append({
+                        'time': current_minute_bucket,
+                        'open': seed_price,
+                        'high': seed_price,
+                        'low': seed_price,
+                        'close': seed_price,
+                        'volume': 0,  # شمعة حية، لا ticks بعد
+                    })
+                    while len(candles) > 300:
+                        candles.pop(0)
                 self.current_candles[asset] = candles
 
     async def fetch_candles(self, asset: str, count: int = 250,
@@ -4297,10 +4312,26 @@ class LiveCandleProvider:
         """
         # ── Layer 1: current_candles (الأفضل — مُحدَّث بالـ ticks) ──
         if not force_historical and timeframe_min == 1:
+            # FIX #26: استدعِ _update_candles_from_ticks قبل الإرجاع لضمان
+            # وجود شمعة حية للدقيقة الحالية. هذا يمنع المشكلة التي كان
+            # السهم يظهر فيها على شمعة أقدم بدقيقة كاملة.
+            self._update_candles_from_ticks()
             with self._candles_lock:
                 candles = list(self.current_candles.get(asset, []))
             if candles and len(candles) >= 210:
                 # لدينا شموع كافية ومُحدَّثة بالـ ticks — استخدمها مباشرة!
+                # تحقق من وجود شمعة حية للدقيقة الحالية
+                current_minute_bucket = (int(time.time()) // 60) * 60
+                last_candle_time = candles[-1]['time'] if candles else 0
+                if last_candle_time < current_minute_bucket:
+                    # أضف شمعة حية للدقيقة الحالية
+                    live_price = self.interceptor.live_prices.get(asset) if self.interceptor else None
+                    seed_price = live_price if live_price is not None else candles[-1]['close']
+                    candles.append({
+                        'time': current_minute_bucket,
+                        'open': seed_price, 'high': seed_price,
+                        'low': seed_price, 'close': seed_price, 'volume': 0,
+                    })
                 if len(candles) > count:
                     candles = candles[-count:]
                 return candles
