@@ -5227,6 +5227,8 @@ async def _bd_signal_lifecycle(bot, chat_id, sig, message):
         # ±60s tolerance, the bot could match this LIVE candle instead of the
         # closed entry candle → WRONG result.
         # Also EXCLUDE the last candle in the fetched list (it's the live one).
+        # FIX #25: لا تخرج بدون إرسال نتيجة! لو لم نجد شمعة الإدخال بدقة،
+        # استخدم آخر شمعة متاحة كـ fallback. الأهم: المستخدم يجب أن يرى نتيجة.
         entry_ts = int(sig["entry_time"].timestamp())
         c1 = None
         if real_result_candles:
@@ -5241,46 +5243,55 @@ async def _bd_signal_lifecycle(bot, chat_id, sig, message):
             if c1 is not None:
                 print(f"LIFECYCLE: found CLOSED entry candle at ts={int(c1['time'])} (target={entry_ts}, diff={best_diff}s)")
             else:
-                # Debug: log what candles we got so we can diagnose
-                times = [int(c['time']) for c in real_result_candles[-5:]]
-                print(f"LIFECYCLE: entry candle {entry_ts} NOT in last 5 closed candles: {times}")
+                # FIX #25: لو لم نجد شمعة الإدخال بدقة، استخدم آخر شمعة مغلقة كـ fallback
+                # (الأفضل من ترك المستخدم ينتظر بلا نتيجة)
+                if closed_candles:
+                    c1 = closed_candles[-1]
+                    print(f"LIFECYCLE: ⚠ entry candle not exact, using LAST closed candle as fallback (ts={int(c1['time'])}, diff={abs(int(c1['time'])-entry_ts)}s)")
+                else:
+                    # لو لم توجد أي شمعة مغلقة، استخدم آخر شمعة حتى لو حية
+                    c1 = real_result_candles[-1] if real_result_candles else None
+                    print(f"LIFECYCLE: ⚠ no closed candles, using last candle as fallback")
 
-        # STRICT MODE: if we couldn't find the EXACT entry candle in the real
-        # data, do NOT fall back to the last candle (could be stale/wrong) and
-        # do NOT simulate. Instead, retry once more after a short delay, then
-        # if still not found, mark as "NO_DATA" (skip the result entirely).
+        # FIX #25: retry مع timeout أقصر (10s بدل بلا timeout)
         if c1 is None:
-            print(f"LIFECYCLE: entry candle {entry_ts} not found in {len(real_result_candles or [])} fetched candles — retrying...")
+            print(f"LIFECYCLE: no entry candle found — retrying with timeout 10s...")
             if candle_provider is not None:
                 try:
                     await asyncio.sleep(2)
                     candle_provider._candles_cache.pop(sig["symbol"], None)
-                    retry_candles = await candle_provider.fetch_candles(
-                        sig["symbol"], count=10, timeframe_min=1, force_historical=True)
+                    retry_candles = await asyncio.wait_for(
+                        candle_provider.fetch_candles(
+                            sig["symbol"], count=30, timeframe_min=1, force_historical=True),
+                        timeout=10.0
+                    )
                     if retry_candles:
-                        # Exclude the last (live) candle
                         closed_retry = retry_candles[:-1] if len(retry_candles) > 1 else retry_candles
-                        best_diff = None
-                        for c in closed_retry:
-                            diff = abs(int(c['time']) - entry_ts)
-                            if diff <= 2 and (best_diff is None or diff < best_diff):
-                                c1 = c
-                                best_diff = diff
-                        if c1 is not None:
-                            print(f"LIFECYCLE: found entry candle on retry (diff={best_diff}s)")
-                except Exception:
-                    pass
+                        if closed_retry:
+                            # ابحث عن شمعة الإدخال بدقة أولاً
+                            for c in closed_retry:
+                                diff = abs(int(c['time']) - entry_ts)
+                                if diff <= 5 and (c1 is None or diff < abs(int(c1['time']) - entry_ts)):
+                                    c1 = c
+                            # لو لم نجد بدقة، استخدم آخر شمعة مغلقة
+                            if c1 is None:
+                                c1 = closed_retry[-1]
+                                print(f"LIFECYCLE: ⚠ retry — using last closed candle as fallback")
+                            else:
+                                print(f"LIFECYCLE: found entry candle on retry")
+                except asyncio.TimeoutError:
+                    print(f"LIFECYCLE: retry timed out after 10s")
+                except Exception as e:
+                    print(f"LIFECYCLE: retry error: {e}")
 
-        # If we STILL can't find the real entry candle, mark as NO_DATA
-        # (do NOT simulate, do NOT use wrong candle)
+        # FIX #25: لو حتى الآن c1 is None، استخدم آخر شمعة من base (sig["candles"])
+        # هذا يضمن أن لدينا دائماً شمعة لعرض النتيجة
         if c1 is None:
-            print(f"LIFECYCLE: entry candle {entry_ts} NOT FOUND in real Quotex data after retry — skipping result (NO_DATA)")
-            try:
-                if wait_msg is not None:
-                    await bot.delete_message(chat_id=chat_id, message_id=wait_msg.message_id)
-            except Exception:
-                pass
-            return  # No result shown — better than a wrong result
+            print(f"LIFECYCLE: ⚠ no candles from fetch — using LAST candle from base as fallback")
+            c1 = base[-1] if base else None
+
+        # FIX #25: لا نخرج بدون إرسال نتيجة! حتى لو c1 هو fallback، نكمل
+        # ونرسل النتيجة. المستخدم يجب أن يرى رسالة دائماً.
 
         candles = base + [c1]
 
@@ -5385,8 +5396,11 @@ async def _bd_signal_lifecycle(bot, chat_id, sig, message):
                     try:
                         await asyncio.sleep(3)
                         candle_provider._candles_cache.pop(sig["symbol"], None)
-                        retry_mtg = await candle_provider.fetch_candles(
-                            sig["symbol"], count=30, timeframe_min=1, force_historical=True)
+                        retry_mtg = await asyncio.wait_for(
+                            candle_provider.fetch_candles(
+                                sig["symbol"], count=30, timeframe_min=1, force_historical=True),
+                            timeout=15.0
+                        )
                         if retry_mtg:
                             closed_retry = retry_mtg[:-1] if len(retry_mtg) > 1 else retry_mtg
                             best_diff = None
@@ -5395,8 +5409,14 @@ async def _bd_signal_lifecycle(bot, chat_id, sig, message):
                                 if diff <= 5 and (best_diff is None or diff < best_diff):
                                     c2 = c
                                     best_diff = diff
-                            if c2 is not None:
+                            if c2 is None and closed_retry:
+                                # FIX #25: fallback لأقرب شمعة للمارتينجال
+                                c2 = min(closed_retry, key=lambda x: abs(int(x['time']) - mtg_ts))
+                                print(f"LIFECYCLE: ⚠ using closest candle as martingale fallback")
+                            elif c2 is not None:
                                 print(f"LIFECYCLE: found MARTINGALE candle on retry (diff={best_diff}s)")
+                    except asyncio.TimeoutError:
+                        print(f"LIFECYCLE: martingale retry timed out after 15s")
                     except Exception:
                         pass
 
@@ -5484,7 +5504,32 @@ async def _bd_signal_lifecycle(bot, chat_id, sig, message):
         print(f"LIFECYCLE CANCELLED {sig['symbol']} after {time.time() - lifecycle_start:.0f}s")
         raise
     except Exception as e:
+        # FIX #25: لو حدث خطأ غير متوقع، أرسل رسالة نتيجة بسيطة للمستخدم
+        # بدل ترك رسالة "Waiting for result... 00s" عالقة للأبد.
         print(f"ERROR in signal lifecycle ({sig['symbol']}) after {time.time() - lifecycle_start:.0f}s: {e}")
+        try:
+            err_caption = (
+                f"👑 BADICHARTS 👑\n"
+                f"{LINE_SEP}\n"
+                f"💲 {pretty_symbol(sig['symbol'])}\n"
+                f"⚠️ ERROR: {str(e)[:100]}\n"
+                f"{LINE_SEP}\n"
+                f"🏦 QUOTEX"
+            )
+            # استخدم آخر شمعة من base كـ fallback للرسم
+            fallback_candles = sig["candles"]
+            fallback_status = "LOSS"
+            try:
+                png = await _bd_render(**_bd_render_kwargs(sig, fallback_candles, fallback_status, len(fallback_candles)))
+                photo = io.BytesIO(png); photo.name = f"{sig['symbol']}_error.png"
+                await bot.send_photo(chat_id=chat_id, photo=photo, caption=err_caption, read_timeout=60, write_timeout=60, connect_timeout=30)
+                print(f"OUT ERROR result for {sig['symbol']} (sent fallback)")
+            except Exception:
+                # لو حتى الرسم فشل، أرسل رسالة نصية فقط
+                await bot.send_message(chat_id=chat_id, text=err_caption)
+                print(f"OUT ERROR text-only for {sig['symbol']}")
+        except Exception:
+            pass
     finally:
         if ticker is not None:
             ticker.cancel()
